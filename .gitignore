@@ -58,7 +58,9 @@ tmp-orc.c
 #
 # VS
 #
-Build
+/Build
+# macOS 上 git 默认不区分大小写，上面一行会误伤源码里的 build/（cmake 脚本），这里显式放行
+!/build/
 *.user
 *.suo
 *.ipch
