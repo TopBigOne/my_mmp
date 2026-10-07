@@ -90,49 +90,57 @@ typedef enum MppDecBufMode_e {
     MPP_DEC_BUF_MODE_BUTT,
 } MppDecBufMode;
 
-typedef void* FileReader;
-typedef void* DecBufMgr;
+typedef void* FileReader;   /* 文件读取器句柄（内部实现在 mpi_dec_utils.c） */
+typedef void* DecBufMgr;    /* 解码 buffer 管理器句柄 */
 
+/*
+ * FileBufSlot - reader 返回的码流数据槽
+ *
+ * reader_read() 每次返回一个 FileBufSlot，包含一包码流数据。
+ * dec_simple 通过 data/size 直接访问数据；
+ * dec_advanced 通过 buf（MppBuffer）做零拷贝传递。
+ */
 typedef struct FileBufSlot_t {
-    RK_S32          index;
-    MppBuffer       buf;
-    size_t          size;
-    RK_U32          eos;
-    char            *data;
+    RK_S32          index;  /* 槽位索引（reader 内部管理的环形 buffer 编号） */
+    MppBuffer       buf;    /* 码流数据对应的 MppBuffer（DMA buffer，advanced 模式用） */
+    size_t          size;   /* 本包码流数据的有效字节数 */
+    RK_U32          eos;    /* End Of Stream 标志：1=文件已读完，这是最后一包 */
+    char            *data;  /* 码流数据指针（simple 模式直接用这个读数据） */
 } FileBufSlot;
 
-/* For overall configure setup */
+/*
+ * MpiDecTestCmd - 解码测试的命令行参数和运行时配置
+ *
+ * 由 main() 中 mpi_dec_test_cmd_init() 从命令行参数解析填充，
+ * 然后传给 dec_decode() 驱动整个解码流程。
+ */
 typedef struct MpiDecTestCmd_t {
-    char            file_input[MAX_FILE_NAME_LENGTH];
-    char            file_output[MAX_FILE_NAME_LENGTH];
+    char            file_input[MAX_FILE_NAME_LENGTH];   /* -i: 输入码流文件路径 */
+    char            file_output[MAX_FILE_NAME_LENGTH];  /* -o: 输出 YUV 文件路径 */
 
-    MppCodingType   type;
-    MppFrameFormat  format;
-    RK_U32          width;
-    RK_U32          height;
+    MppCodingType   type;       /* -t: 编码类型（7=H.264, 16777220=H.265 等） */
+    MppFrameFormat  format;     /* -f: 输出帧格式（JPEG 模式可指定 YUV/RGB） */
+    RK_U32          width;      /* -w: 视频宽（JPEG 必须指定，H.264 可不指定） */
+    RK_U32          height;     /* -h: 视频高 */
 
-    RK_U32          have_input;
-    RK_U32          have_output;
+    RK_U32          have_input;     /* 是否指定了输入文件 */
+    RK_U32          have_output;    /* 是否指定了输出文件 */
 
-    RK_U32          simple;
-    RK_S32          timeout;
-    RK_S32          frame_num;
-    size_t          pkt_size;
-    MppDecBufMode   buf_mode;
+    RK_U32          simple;     /* 解码模式：1=simple（非JPEG），0=advanced（JPEG） */
+    RK_S32          timeout;    /* 超时时间 */
+    RK_S32          frame_num;  /* -n: 解码帧数（-1=无限循环, 0=到EOS, >0=指定帧数） */
+    size_t          pkt_size;   /* 每次读取的码流块大小 */
+    MppDecBufMode   buf_mode;   /* buffer 模式（内部/外部分配） */
 
-    /* use for mpi_dec_multi_test */
-    RK_S32          nthreads;
-    // report information
-    size_t          max_usage;
+    RK_S32          nthreads;   /* 线程数（mpi_dec_multi_test 多路解码用） */
+    size_t          max_usage;  /* 输出：帧 buffer 内存峰值使用量（字节） */
 
-    /* data for share */
-    FileReader      reader;
-    FpsCalc         fps;
+    FileReader      reader;     /* 文件读取器（内部管理读取和分包） */
+    FpsCalc         fps;        /* 帧率计算器 */
 
-    /* runtime log flag */
-    RK_U32          quiet;
-    RK_U32          trace_fps;
-    char            *file_slt;
+    RK_U32          quiet;      /* 静默模式：减少日志输出 */
+    RK_U32          trace_fps;  /* 是否追踪帧率 */
+    char            *file_slt;  /* CRC 校验输出文件路径 */
 } MpiDecTestCmd;
 
 RK_S32  mpi_dec_test_cmd_init(MpiDecTestCmd* cmd, int argc, char **argv);
@@ -145,7 +153,6 @@ void    reader_deinit(FileReader reader);
 void    reader_start(FileReader reader);
 void    reader_sync(FileReader reader);
 void    reader_stop(FileReader reader);
-
 size_t  reader_size(FileReader reader);
 MPP_RET reader_read(FileReader reader, FileBufSlot **buf);
 MPP_RET reader_index_read(FileReader reader, RK_S32 index, FileBufSlot **buf);

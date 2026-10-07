@@ -29,98 +29,166 @@
 #include "mpp_common.h"
 #include "mpi_dec_utils.h"
 
+/*
+ * MpiDecLoopData - 解码循环的运行时数据
+ *
+ * 由 dec_decode() 在栈上创建并填充，传给 thread_decode() 解码线程使用。
+ * 包含解码所需的全部上下文：MPP 实例、输入输出对象、统计信息等。
+ *
+ * 生命周期：dec_decode() 入口创建 → thread_decode() 线程中使用 → dec_decode() 出口销毁
+ */
 typedef struct {
-    MpiDecTestCmd   *cmd;
-    MppCtx          ctx;
-    MppApi          *mpi;
-    RK_U32          quiet;
+    /* ---- MPP 核心对象 ---- */
+    MpiDecTestCmd   *cmd;       /* 命令行参数（输入文件、编码类型、帧数等），只读 */
+    MppCtx          ctx;        /* MPP 上下文（解码器实例），由 mpp_create 创建 */
+    MppApi          *mpi;       /* MPI 函数指针集合（decode_put_packet 等），由 mpp_create 返回 */
+    RK_U32          quiet;      /* 静默模式标志：1=减少日志输出 */
 
-    /* end of stream flag when set quit the loop */
-    RK_U32          loop_end;
+    /* ---- 循环控制 ---- */
+    RK_U32          loop_end;   /* 解码结束标志：置 1 后解码循环退出。
+                                 * 由以下情况触发：文件读完且不循环、达到指定帧数、用户按 Enter */
 
-    /* input and output */
-    DecBufMgr       buf_mgr;
-    MppBufferGroup  frm_grp;
-    MppPacket       packet;
-    MppFrame        frame;
+    /* ---- 输入输出资源 ---- */
+    DecBufMgr       buf_mgr;    /* buffer 管理器：管理帧 BufferGroup 的创建和销毁 */
+    MppBufferGroup  frm_grp;    /* 帧 BufferGroup：解码输出帧的 DMA buffer 池。
+                                 * simple 模式在 info_change 时创建，advanced 模式在初始化时预分配 */
+    MppPacket       packet;     /* 码流数据包：simple 模式复用同一个 packet，每次填入新数据 */
+    MppFrame        frame;      /* 输出帧：仅 advanced（JPEG）模式使用，预分配了 buffer */
 
-    FILE            *fp_output;
-    RK_S32          frame_count;
-    RK_S32          frame_num;
+    /* ---- 输出文件 ---- */
+    FILE            *fp_output; /* YUV 输出文件指针（-o 参数指定），NULL 表示不保存 */
 
-    RK_S64          first_pkt;
-    RK_S64          first_frm;
+    /* ---- 帧计数 ---- */
+    RK_S32          frame_count;/* 已解码的帧数（运行时递增） */
+    RK_S32          frame_num;  /* 目标帧数（来自 cmd->frame_num）：
+                                 * -1=无限循环, 0=解到 EOS, >0=解指定帧数后停止 */
 
-    size_t          max_usage;
-    float           frame_rate;
-    RK_S64          elapsed_time;
-    RK_S64          delay;
-    FILE            *fp_verify;
-    FrmCrc          checkcrc;
+    /* ---- 性能统计 ---- */
+    RK_S64          first_pkt;  /* 第一个 packet 送入解码器的时间戳（微秒） */
+    RK_S64          first_frm;  /* 第一帧解码输出的时间戳（微秒） */
+    size_t          max_usage;  /* 帧 buffer 内存峰值使用量（字节） */
+    float           frame_rate; /* 平均解码帧率（fps），解码完成后计算 */
+    RK_S64          elapsed_time;/* 总解码耗时（微秒） */
+    RK_S64          delay;      /* 首帧延迟 = first_frm - first_pkt（微秒），
+                                 * 衡量从送入第一包到输出第一帧的时间 */
+
+    /* ---- CRC 校验 ---- */
+    FILE            *fp_verify; /* CRC 校验输出文件指针（--slt 参数），NULL 表示不校验 */
+    FrmCrc          checkcrc;   /* 逐帧 CRC 计算上下文（luma + chroma），用于自动化正确性比对 */
 } MpiDecLoopData;
 
+/*
+ * dec_simple - 简单模式解码函数（每次调用处理一个数据包）
+ *
+ * 整体流程：
+ *   1. 从文件读取一包码流数据（如一帧 H.264 NALU）
+ *   2. 把码流数据送进 MPP 解码器（decode_put_packet）
+ *   3. 循环取出解码后的图像帧（decode_get_frame）
+ *   4. 处理取到的帧：保存文件 / CRC 校验 / 统计帧率
+ *
+ * 调用方式：外层 while (!data->loop_end) 循环调用本函数，每次处理一个 packet，
+ *           直到文件读完或达到指定帧数。
+ *
+ * 注意：这是"简单接口"（decode_put_packet / decode_get_frame），
+ *       与 dec_advanced 使用的"高级 Task 接口"（poll/dequeue/enqueue）不同。
+ *       简单接口更易上手，适合大多数场景。
+ */
 static int dec_simple(MpiDecLoopData *data)
 {
-    RK_U32 pkt_done = 0;
-    RK_U32 pkt_eos  = 0;
+    RK_U32 pkt_done = 0;       /* 标记当前 packet 是否已成功送入解码器 */
+    RK_U32 pkt_eos  = 0;       /* 标记当前 packet 是否是码流的最后一包（End Of Stream） */
     MPP_RET ret = MPP_OK;
     MpiDecTestCmd *cmd = data->cmd;
-    MppCtx ctx  = data->ctx;
-    MppApi *mpi = data->mpi;
-    MppPacket packet = data->packet;
+    MppCtx ctx  = data->ctx;   /* MPP 上下文，代表一个解码器实例 */
+    MppApi *mpi = data->mpi;   /* MPI 函数指针集合，通过它调用 decode_put_packet 等 */
+    MppPacket packet = data->packet;  /* 复用同一个 MppPacket 对象，每次填入新数据 */
     FileBufSlot *slot = NULL;
     RK_U32 quiet = data->quiet;
     FrmCrc *checkcrc = &data->checkcrc;
 
-    // when packet size is valid read the input binary file
+    /* ================================================================
+     * 第一步：从输入文件读取一包码流数据
+     * reader 内部会按码流格式（H.264/H.265 等）做分包，
+     * 每次返回一个 FileBufSlot，包含 data 指针、size 和 eos 标志。
+     * ================================================================ */
     ret = reader_read(cmd->reader, &slot);
 
     mpp_assert(ret == MPP_OK);
     mpp_assert(slot);
 
-    pkt_eos = slot->eos;
+    pkt_eos = slot->eos;  /* reader 读到文件末尾时会置 eos = 1 */
 
+    /* 处理文件结束（EOS）情况 */
     if (pkt_eos) {
         if (data->frame_num < 0 || data->frame_num > data->frame_count) {
+            /*
+             * frame_num < 0 表示无限循环播放；
+             * frame_num > frame_count 表示还没解够指定帧数，需要循环。
+             * 此时回到文件开头重新读取，继续解码。
+             */
             mpp_log_q(quiet, "%p loop again\n", ctx);
             reader_rewind(cmd->reader);
-            pkt_eos = 0;
+            pkt_eos = 0;  /* 清掉 eos，让解码继续 */
         } else {
+            /* 已经解够帧数，标记整个解码循环结束 */
             mpp_log_q(quiet, "%p found last packet\n", ctx);
             data->loop_end = 1;
         }
     }
 
+    /* ================================================================
+     * 第二步：把读到的码流数据填入 MppPacket
+     *
+     * MppPacket 是 MPP 对一维码流数据的封装：
+     *   - data/size: 码流 buffer 的起始地址和总容量
+     *   - pos/length: 当前未消费数据的起始位置和剩余长度
+     *
+     * 首次设置时 pos = data, length = size（整包数据都未消费）。
+     * 如果 decode_put_packet 一次没消费完，pos 会前移、length 会减少，
+     * 下次继续送剩余部分（本函数外层 do-while 会处理这种情况）。
+     * ================================================================ */
     mpp_packet_set_data(packet, slot->data);
     mpp_packet_set_size(packet, slot->size);
     mpp_packet_set_pos(packet, slot->data);
     mpp_packet_set_length(packet, slot->size);
-    // setup eos flag
+    /* 如果是最后一包，给 packet 打上 EOS 标志，通知解码器码流结束 */
     if (pkt_eos)
         mpp_packet_set_eos(packet);
 
+    /* ================================================================
+     * 第三步：送包 + 取帧 的主循环
+     *
+     * 外层 do-while：负责把 packet 送入解码器（可能需要重试）
+     * 内层 do-while：负责取出所有已解码的帧
+     *
+     * 为什么要循环？
+     *   - 解码器内部队列可能满了，decode_put_packet 会失败，需要等一下重试
+     *   - 一个 packet 送进去后，解码器可能同时输出多帧（比如 B 帧参考链上的缓存帧）
+     * ================================================================ */
     do {
-        RK_U32 frm_eos = 0;
-        RK_S32 times = 30;
+        RK_U32 frm_eos = 0;   /* 标记是否取到了带 EOS 标志的帧（解码器最终输出） */
+        RK_S32 times = 30;    /* decode_get_frame 超时重试次数（最多 30 次 × 1ms = 30ms） */
 
-        // send the packet first if packet is not done
+        /* ---- 送包：把码流 packet 送入解码器内部队列 ---- */
         if (!pkt_done) {
             ret = mpi->decode_put_packet(ctx, packet);
             if (MPP_OK == ret) {
-                pkt_done = 1;
+                pkt_done = 1;  /* 送成功，标记完成 */
                 if (!data->first_pkt)
-                    data->first_pkt = mpp_time();
+                    data->first_pkt = mpp_time();  /* 记录第一包送入的时间戳，用于统计延迟 */
             }
+            /* 如果失败（队列满），pkt_done 仍为 0，外层循环会 sleep 后重试 */
         }
 
-        // then get all available frame and release
+        /* ---- 取帧：循环取出所有可用的解码帧 ---- */
         do {
-            RK_S32 get_frm = 0;
+            RK_S32 get_frm = 0;   /* 本轮是否成功取到了帧 */
             MppFrame frame = NULL;
 
         try_again:
             ret = mpi->decode_get_frame(ctx, &frame);
             if (MPP_ERR_TIMEOUT == ret) {
+                /* 超时：解码器还在工作中，稍等重试 */
                 if (times > 0) {
                     times--;
                     msleep(1);
@@ -134,20 +202,39 @@ static int dec_simple(MpiDecLoopData *data)
             }
 
             if (frame) {
+                /*
+                 * 取到帧后，首先检查是否是 info_change 事件。
+                 *
+                 * info_change 是 MPP 解码的关键机制：
+                 * 解码器解析到 SPS/PPS 后，知道了视频的宽高、stride 等信息，
+                 * 但还没有帧缓冲区来存放解码输出。它会发出一个特殊的 "info change" 帧，
+                 * 告诉应用层："我需要这么大的 buffer，请分配好再通知我继续"。
+                 *
+                 * 应用层处理流程：
+                 *   1. 读取 info_change 帧中的 width/height/stride/buf_size
+                 *   2. 创建 BufferGroup 并分配足够的 buffer
+                 *   3. 用 MPP_DEC_SET_EXT_BUF_GROUP 把 buffer 交给解码器
+                 *   4. 用 MPP_DEC_SET_INFO_CHANGE_READY 通知解码器可以继续解码了
+                 */
                 if (mpp_frame_get_info_change(frame)) {
                     RK_U32 width = mpp_frame_get_width(frame);
                     RK_U32 height = mpp_frame_get_height(frame);
-                    RK_U32 hor_stride = mpp_frame_get_hor_stride(frame);
-                    RK_U32 ver_stride = mpp_frame_get_ver_stride(frame);
-                    RK_U32 buf_size = mpp_frame_get_buf_size(frame);
+                    RK_U32 hor_stride = mpp_frame_get_hor_stride(frame);  /* 水平步长（对齐后的宽） */
+                    RK_U32 ver_stride = mpp_frame_get_ver_stride(frame);  /* 垂直步长（对齐后的高） */
+                    RK_U32 buf_size = mpp_frame_get_buf_size(frame);      /* 解码器需要的单帧 buffer 大小 */
                     MppBufferGroup grp = NULL;
 
                     mpp_log_q(quiet, "%p decode_get_frame get info changed found\n", ctx);
                     mpp_log_q(quiet, "%p decoder require buffer w:h [%d:%d] stride [%d:%d] buf_size %d",
                               ctx, width, height, hor_stride, ver_stride, buf_size);
 
+                    /*
+                     * 创建 BufferGroup：
+                     * buf_size = 单帧大小，24 = 最大 buffer 数量（参考帧 + 输出帧 + 余量），
+                     * buf_mode 控制内存模式（内部分配 / 外部分配）
+                     */
                     grp = dec_buf_mgr_setup(data->buf_mgr, buf_size, 24, cmd->buf_mode);
-                    /* Set buffer to mpp decoder */
+                    /* 把 BufferGroup 交给解码器，解码器后续从中取 buffer 存放解码输出 */
                     ret = mpi->control(ctx, MPP_DEC_SET_EXT_BUF_GROUP, grp);
                     if (ret) {
                         mpp_err("%p set buffer group failed ret %d\n", ctx, ret);
@@ -155,28 +242,33 @@ static int dec_simple(MpiDecLoopData *data)
                     }
                     data->frm_grp = grp;
 
-                    /*
-                     * All buffer group config done. Set info change ready to let
-                     * decoder continue decoding
-                     */
+                    /* 通知解码器：buffer 准备好了，可以继续解码 */
                     ret = mpi->control(ctx, MPP_DEC_SET_INFO_CHANGE_READY, NULL);
                     if (ret) {
                         mpp_err("%p info change ready failed ret %d\n", ctx, ret);
                         break;
                     }
                 } else {
+                    /*
+                     * 正常的解码输出帧 —— 这才是我们要的图像数据。
+                     * 帧数据在 frame 内部的 MppBuffer 中，格式为 YUV（NV12 等），
+                     * 可以保存到文件、送显示、或做后处理。
+                     */
                     char log_buf[256];
                     RK_S32 log_size = sizeof(log_buf) - 1;
                     RK_S32 log_len = 0;
-                    RK_U32 err_info = mpp_frame_get_errinfo(frame);
-                    RK_U32 discard = mpp_frame_get_discard(frame);
+                    RK_U32 err_info = mpp_frame_get_errinfo(frame);  /* 非 0 表示该帧有错误 */
+                    RK_U32 discard = mpp_frame_get_discard(frame);   /* 非 0 表示该帧应被丢弃 */
 
+                    /* 记录第一帧输出的时间戳，用于计算首帧延迟 */
                     if (!data->first_frm)
                         data->first_frm = mpp_time();
 
+                    /* 拼装日志信息 */
                     log_len += snprintf(log_buf + log_len, log_size - log_len,
                                         "decode get frame %d", data->frame_count);
 
+                    /* 如果帧携带 meta 信息，提取 temporal_id（时域层级，SVC 分层编码用） */
                     if (mpp_frame_has_meta(frame)) {
                         MppMeta meta = mpp_frame_get_meta(frame);
                         RK_S32 temporal_id = 0;
@@ -194,29 +286,34 @@ static int dec_simple(MpiDecLoopData *data)
                     mpp_log_q(quiet, "%p %s\n", ctx, log_buf);
 
                     data->frame_count++;
+                    /* 如果指定了输出文件且帧没有错误，将 YUV 数据写入文件 */
                     if (data->fp_output && !err_info)
                         dump_mpp_frame_to_file(frame, data->fp_output);
 
+                    /* 如果指定了校验文件，计算帧 CRC 并写入（用于自动化测试比对） */
                     if (data->fp_verify) {
                         calc_frm_crc(frame, checkcrc);
                         write_frm_crc(data->fp_verify, checkcrc);
                     }
 
-                    fps_calc_inc(cmd->fps);
+                    fps_calc_inc(cmd->fps);  /* 帧率计数器 +1 */
                 }
-                frm_eos = mpp_frame_get_eos(frame);
-                mpp_frame_deinit(&frame);
+                frm_eos = mpp_frame_get_eos(frame);  /* 检查该帧是否携带 EOS 标志 */
+                mpp_frame_deinit(&frame);  /* 释放帧（归还 buffer 给 BufferGroup） */
                 get_frm = 1;
             }
 
-            // try get runtime frame memory usage
+            /* 统计帧 buffer 内存峰值使用量 */
             if (data->frm_grp) {
                 size_t usage = mpp_buffer_group_usage(data->frm_grp);
                 if (usage > data->max_usage)
                     data->max_usage = usage;
             }
 
-            // if last packet is send but last frame is not found continue
+            /*
+             * EOS 处理：最后一个 packet 已送入，但还没取到带 EOS 标志的帧。
+             * 这说明解码器内部还有缓存帧未输出（比如 B 帧重排序），需要继续取。
+             */
             if (pkt_eos && pkt_done && !frm_eos) {
                 msleep(1);
                 continue;
@@ -227,30 +324,35 @@ static int dec_simple(MpiDecLoopData *data)
                 break;
             }
 
+            /* 检查是否已解够指定帧数 */
             if ((data->frame_num > 0 && (data->frame_count >= data->frame_num)) ||
                 ((data->frame_num == 0) && frm_eos))
                 break;
 
+            /*
+             * 如果本轮取到了帧（get_frm=1），继续尝试取下一帧（解码器可能还有输出）；
+             * 如果没取到帧（get_frm=0），说明当前没有更多输出了，退出内层循环。
+             */
             if (get_frm)
                 continue;
             break;
         } while (1);
 
+        /* 外层也检查帧数限制 */
         if ((data->frame_num > 0 && (data->frame_count >= data->frame_num)) ||
             ((data->frame_num == 0) && frm_eos)) {
             data->loop_end = 1;
             break;
         }
 
+        /* packet 已成功送入解码器，本次调用完成 */
         if (pkt_done)
             break;
 
         /*
-         * why sleep here:
-         * mpi->decode_put_packet will failed when packet in internal queue is
-         * full,waiting the package is consumed .Usually hardware decode one
-         * frame which resolution is 1080p needs 2 ms,so here we sleep 1ms
-         * * is enough.
+         * 走到这里说明 decode_put_packet 失败了（解码器内部队列满）。
+         * 等 1ms 让解码器消费掉一些数据后重试。
+         * 1080p 硬件解码一帧约 2ms，所以 sleep 1ms 就够了。
          */
         msleep(1);
     } while (1);
@@ -258,6 +360,23 @@ static int dec_simple(MpiDecLoopData *data)
     return ret;
 }
 
+/*
+ * dec_advanced - 高级模式解码函数（使用 Task 接口，每次调用处理一帧）
+ *
+ * 与 dec_simple 的区别：
+ *   - dec_simple 使用"简单接口"：decode_put_packet / decode_get_frame
+ *     适合大多数场景，MPP 内部自动管理输入输出队列。
+ *   - dec_advanced 使用"Task 接口"：poll / dequeue / enqueue
+ *     应用自己管理 Task 的生命周期，可以精确控制输入输出 buffer 的绑定关系。
+ *     主要用于 JPEG 解码（需要指定输出 buffer 和格式）。
+ *
+ * Task 接口的数据流：
+ *   输入端口(INPUT)                        输出端口(OUTPUT)
+ *   poll(INPUT) → 等待可用 task             poll(OUTPUT) → 等待解码完成
+ *   dequeue(INPUT) → 取出空 task            dequeue(OUTPUT) → 取出已完成 task
+ *   设置 task 的输入 packet 和输出 frame     从 task 中取出解码后的 frame
+ *   enqueue(INPUT) → 送回给解码器            enqueue(OUTPUT) → 归还 task
+ */
 static int dec_advanced(MpiDecLoopData *data)
 {
     MPP_RET ret = MPP_OK;
@@ -265,29 +384,36 @@ static int dec_advanced(MpiDecLoopData *data)
     MppCtx ctx  = data->ctx;
     MppApi *mpi = data->mpi;
     MppPacket packet = NULL;
-    MppFrame  frame  = data->frame;
+    MppFrame  frame  = data->frame;  /* 复用预分配的 frame（含 buffer），JPEG 模式需要 */
     MppTask task = NULL;
     RK_U32 quiet = data->quiet;
     FileBufSlot *slot = NULL;
     FrmCrc *checkcrc = &data->checkcrc;
 
+    /* 读取一包码流数据（index=0 表示下一包） */
     ret = reader_index_read(cmd->reader, 0, &slot);
     mpp_assert(ret == MPP_OK);
     mpp_assert(slot);
 
+    /* 用 slot 的 MppBuffer 创建 packet（零拷贝，共享同一块 buffer） */
     mpp_packet_init_with_buffer(&packet, slot->buf);
 
-    // setup eos flag
     if (slot->eos)
         mpp_packet_set_eos(packet);
 
+    /* ================================================================
+     * 输入端：把码流 packet 通过 Task 送入解码器
+     * ================================================================ */
+
+    /* poll 输入端口：阻塞等待，直到有空闲的 task 可用 */
     ret = mpi->poll(ctx, MPP_PORT_INPUT, MPP_POLL_BLOCK);
     if (ret) {
         mpp_err("%p mpp input poll failed\n", ctx);
         return ret;
     }
 
-    ret = mpi->dequeue(ctx, MPP_PORT_INPUT, &task);  /* input queue */
+    /* 从输入队列取出一个空 task */
+    ret = mpi->dequeue(ctx, MPP_PORT_INPUT, &task);
     if (ret) {
         mpp_err("%p mpp task input dequeue failed\n", ctx);
         return ret;
@@ -295,10 +421,17 @@ static int dec_advanced(MpiDecLoopData *data)
 
     mpp_assert(task);
 
+    /*
+     * 给 task 绑定输入和输出：
+     * - KEY_INPUT_PACKET: 要解码的码流数据
+     * - KEY_OUTPUT_FRAME: 解码结果要写入的帧（预分配了 buffer）
+     * 这是 Task 接口的核心：应用显式指定"用这个 packet 解码，结果放到这个 frame 里"
+     */
     mpp_task_meta_set_packet(task, KEY_INPUT_PACKET, packet);
     mpp_task_meta_set_frame (task, KEY_OUTPUT_FRAME,  frame);
 
-    ret = mpi->enqueue(ctx, MPP_PORT_INPUT, task);  /* input queue */
+    /* 把填好的 task 送回输入队列，解码器开始工作 */
+    ret = mpi->enqueue(ctx, MPP_PORT_INPUT, task);
     if (ret) {
         mpp_err("%p mpp task input enqueue failed\n", ctx);
         return ret;
@@ -307,14 +440,19 @@ static int dec_advanced(MpiDecLoopData *data)
     if (!data->first_pkt)
         data->first_pkt = mpp_time();
 
-    /* poll and wait here */
+    /* ================================================================
+     * 输出端：等待解码完成，取出解码后的帧
+     * ================================================================ */
+
+    /* poll 输出端口：阻塞等待解码完成 */
     ret = mpi->poll(ctx, MPP_PORT_OUTPUT, MPP_POLL_BLOCK);
     if (ret) {
         mpp_err("%p mpp output poll failed\n", ctx);
         return ret;
     }
 
-    ret = mpi->dequeue(ctx, MPP_PORT_OUTPUT, &task); /* output queue */
+    /* 从输出队列取出已完成的 task */
+    ret = mpi->dequeue(ctx, MPP_PORT_OUTPUT, &task);
     if (ret) {
         mpp_err("%p mpp task output dequeue failed\n", ctx);
         return ret;
@@ -325,13 +463,14 @@ static int dec_advanced(MpiDecLoopData *data)
     if (task) {
         MppFrame frame_out = NULL;
 
+        /* 从 task 中取出解码后的 frame（实际数据在之前绑定的 buffer 中） */
         mpp_task_meta_get_frame(task, KEY_OUTPUT_FRAME, &frame_out);
 
         if (frame) {
             if (!data->first_frm)
                 data->first_frm = mpp_time();
 
-            /* write frame to file here */
+            /* 将解码后的 YUV 数据写入输出文件 */
             if (data->fp_output)
                 dump_mpp_frame_to_file(frame, data->fp_output);
 
@@ -349,6 +488,7 @@ static int dec_advanced(MpiDecLoopData *data)
             fps_calc_inc(cmd->fps);
         }
 
+        /* 检查是否达到帧数限制或 EOS */
         if (data->frame_num > 0) {
             if (data->frame_count >= data->frame_num)
                 data->loop_end = 1;
@@ -357,21 +497,25 @@ static int dec_advanced(MpiDecLoopData *data)
                 data->loop_end = 1;
         }
 
-        /* output queue */
+        /* 把已处理的 task 归还到输出队列，让解码器可以复用这个 task 槽位 */
         ret = mpi->enqueue(ctx, MPP_PORT_OUTPUT, task);
         if (ret)
             mpp_err("%p mpp task output enqueue failed\n", ctx);
     }
 
-    /*
-     * The following input port task dequeue and enqueue is to make sure that
-     * the input packet can be released. We can directly deinit the input packet
-     * after frame output in most cases.
-     */
+    /* ================================================================
+     * 回收输入端 task：释放输入 packet，归还 task 槽位
+     *
+     * 这一步是 Task 接口的"礼仪"——解码器用完 packet 后，
+     * 应用需要从输入队列取回 task，释放 packet，再把空 task 归还。
+     * 不做这一步会导致 task 泄漏，输入队列最终会满。
+     * ================================================================ */
     if (0) {
+        /* 简单做法：直接释放 packet（大多数情况下可以，但不够规范） */
         mpp_packet_deinit(&packet);
     } else {
-        ret = mpi->dequeue(ctx, MPP_PORT_INPUT, &task);  /* input queue */
+        /* 规范做法：从输入队列取回 task，取出 packet 后释放，再归还空 task */
+        ret = mpi->dequeue(ctx, MPP_PORT_INPUT, &task);
         if (ret) {
             mpp_err("%p mpp task input dequeue failed\n", ctx);
             return ret;
@@ -383,12 +527,13 @@ static int dec_advanced(MpiDecLoopData *data)
 
             mpp_task_meta_get_packet(task, KEY_INPUT_PACKET, &packet_out);
 
+            /* 校验取回的 packet 和之前送入的是同一个 */
             if (!packet_out || packet_out != packet)
                 mpp_err_f("mismatch packet %p -> %p\n", packet, packet_out);
 
-            mpp_packet_deinit(&packet_out);
+            mpp_packet_deinit(&packet_out);  /* 释放 packet */
 
-            /* input empty task back to mpp to maintain task status */
+            /* 把空 task 归还到输入队列，维持 task 池的平衡 */
             ret = mpi->enqueue(ctx, MPP_PORT_INPUT, task);
             if (ret)
                 mpp_err("%p mpp task input enqueue failed\n", ctx);
@@ -398,6 +543,15 @@ static int dec_advanced(MpiDecLoopData *data)
     return ret;
 }
 
+/*
+ * thread_decode - 解码工作线程入口
+ *
+ * 在独立线程中运行解码循环，根据 simple 标志选择：
+ *   - simple 模式（非 JPEG）→ 循环调用 dec_simple
+ *   - advanced 模式（JPEG）  → 循环调用 dec_advanced
+ *
+ * 线程结束后统计总耗时、帧率和首帧延迟。
+ */
 void *thread_decode(void *arg)
 {
     MpiDecLoopData *data = (MpiDecLoopData *)arg;
@@ -406,17 +560,26 @@ void *thread_decode(void *arg)
     MppApi *mpi = data->mpi;
     RK_S64 t_s, t_e;
 
+    /* 初始化 CRC 校验缓冲区（用于逐帧校验解码正确性） */
     memset(&data->checkcrc, 0, sizeof(data->checkcrc));
     data->checkcrc.luma.sum = mpp_malloc(RK_ULONG, 512);
     data->checkcrc.chroma.sum = mpp_malloc(RK_ULONG, 512);
 
-    t_s = mpp_time();
+    t_s = mpp_time();  /* 记录解码开始时间 */
 
     if (cmd->simple) {
+        /*
+         * 简单模式：非 JPEG 格式（H.264/H.265/VP9 等）
+         * 循环调用 dec_simple，每次处理一个 packet，直到 loop_end 被置位
+         */
         while (!data->loop_end)
             dec_simple(data);
     } else {
-        /* NOTE: change output format before jpeg decoding */
+        /*
+         * 高级模式：JPEG 格式
+         * JPEG 可能需要指定输出格式（如 YUV420 → RGB），
+         * 在开始解码前通过 control 接口设置
+         */
         if (MPP_FRAME_FMT_IS_YUV(cmd->format) || MPP_FRAME_FMT_IS_RGB(cmd->format)) {
             MPP_RET ret = mpi->control(ctx, MPP_DEC_SET_OUTPUT_FORMAT, &cmd->format);
             if (ret) {
@@ -429,11 +592,12 @@ void *thread_decode(void *arg)
             dec_advanced(data);
     }
 
+    /* ---- 解码完成，统计性能数据 ---- */
     t_e = mpp_time();
-    data->elapsed_time = t_e - t_s;
+    data->elapsed_time = t_e - t_s;                      /* 总耗时（微秒） */
     data->frame_count = data->frame_count;
-    data->frame_rate = (float)data->frame_count * 1000000 / data->elapsed_time;
-    data->delay = data->first_frm - data->first_pkt;
+    data->frame_rate = (float)data->frame_count * 1000000 / data->elapsed_time;  /* 平均帧率 */
+    data->delay = data->first_frm - data->first_pkt;     /* 首帧延迟 = 第一帧输出时间 - 第一包送入时间 */
 
     mpp_log("decode %d frames time %lld ms delay %3d ms fps %3.2f\n",
             data->frame_count, (RK_S64)(data->elapsed_time / 1000),
@@ -445,27 +609,41 @@ void *thread_decode(void *arg)
     return NULL;
 }
 
+/*
+ * dec_decode - 解码主函数（完整的解码器生命周期）
+ *
+ * 这是 mpi_dec_test 的核心函数，完整展示了 MPP 解码器的使用流程：
+ *
+ *   1. 打开输出文件
+ *   2. 根据模式（simple/advanced）准备 packet 或 frame
+ *   3. mpp_create  → 创建 MPP 实例
+ *   4. mpp_init    → 初始化为解码器，指定编码格式
+ *   5. control     → 配置解码参数（split_parse 等）
+ *   6. 启动解码线程 → thread_decode
+ *   7. 等待解码完成
+ *   8. 释放所有资源（逆序释放，避免泄漏）
+ */
 int dec_decode(MpiDecTestCmd *cmd)
 {
-    // base flow context
+    /* MPP 上下文和 API */
     MppCtx ctx          = NULL;
     MppApi *mpi         = NULL;
 
-    // input / output
+    /* 输入码流 / 输出帧 */
     MppPacket packet    = NULL;
     MppFrame  frame     = NULL;
 
-    // paramter for resource malloc
+    /* 视频参数 */
     RK_U32 width        = cmd->width;
     RK_U32 height       = cmd->height;
-    MppCodingType type  = cmd->type;
+    MppCodingType type  = cmd->type;   /* 编码格式：H.264/H.265/JPEG 等 */
 
-    // config for runtime mode
+    /* 解码配置 */
     MppDecCfg cfg       = NULL;
-    RK_U32 need_split   = 1;
+    RK_U32 need_split   = 1;   /* 开启内部分帧器（见下方说明） */
 
-    // resources
-    MppBuffer frm_buf   = NULL;
+    /* 资源 */
+    MppBuffer frm_buf   = NULL;   /* advanced 模式预分配的帧 buffer */
     pthread_t thd;
     pthread_attr_t attr;
     MpiDecLoopData data;
@@ -475,8 +653,17 @@ int dec_decode(MpiDecTestCmd *cmd)
     memset(&data, 0, sizeof(data));
     pthread_attr_init(&attr);
 
+    /*
+     * 模式选择：非 JPEG 用 simple 模式，JPEG 用 advanced 模式。
+     * JPEG 需要 advanced 模式是因为：
+     * - JPEG 需要预先指定输出 buffer（不像 H.264 有 info_change 流程）
+     * - JPEG 可能需要指定输出格式（YUV420/YUV422/RGB）
+     */
     cmd->simple = (cmd->type != MPP_VIDEO_CodingMJPEG) ? (1) : (0);
 
+    /* ================================================================
+     * 第一步：打开输出文件和校验文件
+     * ================================================================ */
     if (cmd->have_output) {
         data.fp_output = fopen(cmd->file_output, "w+b");
         if (NULL == data.fp_output) {
@@ -491,6 +678,9 @@ int dec_decode(MpiDecTestCmd *cmd)
             mpp_err("failed to open verify file %s\n", cmd->file_slt);
     }
 
+    /* ================================================================
+     * 第二步：初始化 buffer 管理器和输入输出对象
+     * ================================================================ */
     ret = dec_buf_mgr_init(&data.buf_mgr);
     if (ret) {
         mpp_err("dec_buf_mgr_init failed\n");
@@ -498,21 +688,31 @@ int dec_decode(MpiDecTestCmd *cmd)
     }
 
     if (cmd->simple) {
+        /*
+         * simple 模式：创建一个空的 MppPacket，后续每次 dec_simple 填入数据。
+         * 帧 buffer 由解码器在 info_change 时自动管理，无需预分配。
+         */
         ret = mpp_packet_init(&packet, NULL, 0);
         if (ret) {
             mpp_err("mpp_packet_init failed\n");
             goto MPP_TEST_OUT;
         }
     } else {
+        /*
+         * advanced 模式（JPEG）：需要预分配输出 frame 和 buffer。
+         * stride 对齐到 16 字节（硬件要求）。
+         * buffer 大小用 4 倍 w*h 是为了兼容 YUV422 甚至 YUV444。
+         */
         RK_U32 hor_stride = MPP_ALIGN(width, 16);
         RK_U32 ver_stride = MPP_ALIGN(height, 16);
 
-        ret = mpp_frame_init(&frame); /* output frame */
+        ret = mpp_frame_init(&frame);
         if (ret) {
             mpp_err("mpp_frame_init failed\n");
             goto MPP_TEST_OUT;
         }
 
+        /* 创建 BufferGroup：4 倍 stride*stride 大小，最多 4 个 buffer */
         data.frm_grp = dec_buf_mgr_setup(data.buf_mgr, hor_stride * ver_stride * 4, 4, cmd->buf_mode);
         if (!data.frm_grp) {
             mpp_err("failed to get buffer group for input frame ret %d\n", ret);
@@ -521,11 +721,8 @@ int dec_decode(MpiDecTestCmd *cmd)
         }
 
         /*
-         * NOTE: For jpeg could have YUV420 and YUV422 the buffer should be
-         * larger for output. And the buffer dimension should align to 16.
-         * YUV420 buffer is 3/2 times of w*h.
-         * YUV422 buffer is 2 times of w*h.
-         * So create larger buffer with 2 times w*h.
+         * 从 BufferGroup 中分配一个 buffer 绑定到 frame。
+         * JPEG 解码器会把解码结果直接写入这个 buffer。
          */
         ret = mpp_buffer_get(data.frm_grp, &frm_buf, hor_stride * ver_stride * 4);
         if (ret) {
@@ -536,7 +733,14 @@ int dec_decode(MpiDecTestCmd *cmd)
         mpp_frame_set_buffer(frame, frm_buf);
     }
 
-    // decoder demo
+    /* ================================================================
+     * 第三步：创建并初始化 MPP 解码器
+     *
+     * mpp_create: 创建 MPP 实例，获得 ctx（上下文）和 mpi（API 函数集合）
+     * mpp_init:   初始化为解码器（MPP_CTX_DEC），指定编码格式（H.264/H.265 等）
+     *
+     * 这两步完成后，解码器就可以工作了。
+     * ================================================================ */
     ret = mpp_create(&ctx, &mpi);
     if (ret) {
         mpp_err("mpp_create failed\n");
@@ -552,9 +756,16 @@ int dec_decode(MpiDecTestCmd *cmd)
         goto MPP_TEST_OUT;
     }
 
+    /* ================================================================
+     * 第四步：配置解码参数
+     *
+     * MPP 的配置流程："get → modify → set"
+     *   1. MPP_DEC_GET_CFG: 获取当前默认配置
+     *   2. mpp_dec_cfg_set_xxx: 修改需要的参数
+     *   3. MPP_DEC_SET_CFG: 把修改后的配置写回
+     * ================================================================ */
     mpp_dec_cfg_init(&cfg);
 
-    /* get default config from decoder context */
     ret = mpi->control(ctx, MPP_DEC_GET_CFG, cfg);
     if (ret) {
         mpp_err("%p failed to get decoder cfg ret %d\n", ctx, ret);
@@ -562,8 +773,10 @@ int dec_decode(MpiDecTestCmd *cmd)
     }
 
     /*
-     * split_parse is to enable mpp internal frame spliter when the input
-     * packet is not aplited into frames.
+     * split_parse = 1：开启 MPP 内部分帧器。
+     * 当输入数据不是按帧分好的（比如直接读文件的一大块数据），
+     * MPP 内部会自动寻找 NALU 边界进行分帧。
+     * 大多数场景都应该开启。
      */
     ret = mpp_dec_cfg_set_u32(cfg, "base:split_parse", need_split);
     if (ret) {
@@ -577,6 +790,9 @@ int dec_decode(MpiDecTestCmd *cmd)
         goto MPP_TEST_OUT;
     }
 
+    /* ================================================================
+     * 第五步：填充线程数据结构，启动解码线程
+     * ================================================================ */
     data.cmd            = cmd;
     data.ctx            = ctx;
     data.mpi            = mpi;
@@ -584,7 +800,7 @@ int dec_decode(MpiDecTestCmd *cmd)
     data.packet         = packet;
     data.frame          = frame;
     data.frame_count    = 0;
-    data.frame_num      = cmd->frame_num;
+    data.frame_num      = cmd->frame_num;  /* -1=无限循环, 0=解到 EOS, >0=指定帧数 */
     data.quiet          = cmd->quiet;
 
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
@@ -595,8 +811,12 @@ int dec_decode(MpiDecTestCmd *cmd)
         goto MPP_TEST_OUT;
     }
 
+    /*
+     * 无限循环模式（frame_num < 0）：
+     * 主线程等待用户按 Enter 键，然后设置 loop_end 通知解码线程退出。
+     * 适合压力测试、长时间稳定性测试等场景。
+     */
     if (cmd->frame_num < 0) {
-        // wait for input then quit decoding
         mpp_log("*******************************************\n");
         mpp_log("**** Press Enter to stop loop decoding ****\n");
         mpp_log("*******************************************\n");
@@ -605,16 +825,25 @@ int dec_decode(MpiDecTestCmd *cmd)
         data.loop_end = 1;
     }
 
+    /* 等待解码线程结束 */
     pthread_join(thd, NULL);
 
-    cmd->max_usage = data.max_usage;
+    cmd->max_usage = data.max_usage;  /* 回传内存峰值使用量 */
 
+    /* 重置解码器（清空内部缓存，为销毁做准备） */
     ret = mpi->reset(ctx);
     if (ret) {
         mpp_err("%p mpi->reset failed\n", ctx);
         goto MPP_TEST_OUT;
     }
 
+    /* ================================================================
+     * 第六步：释放所有资源（逆序释放）
+     *
+     * 释放顺序很重要：
+     *   packet/frame → ctx(mpp_destroy) → frm_buf → buf_mgr → 文件 → cfg
+     * 先释放使用者，再释放被依赖的资源。
+     * ================================================================ */
 MPP_TEST_OUT:
     if (data.packet) {
         mpp_packet_deinit(&data.packet);
@@ -627,20 +856,20 @@ MPP_TEST_OUT:
     }
 
     if (ctx) {
-        mpp_destroy(ctx);
+        mpp_destroy(ctx);   /* 销毁 MPP 实例（释放内部所有编解码资源） */
         ctx = NULL;
     }
 
     if (!cmd->simple) {
         if (frm_buf) {
-            mpp_buffer_put(frm_buf);
+            mpp_buffer_put(frm_buf);  /* 归还 buffer（引用计数 -1） */
             frm_buf = NULL;
         }
     }
 
     data.frm_grp = NULL;
     if (data.buf_mgr) {
-        dec_buf_mgr_deinit(data.buf_mgr);
+        dec_buf_mgr_deinit(data.buf_mgr);  /* 销毁 BufferGroup 管理器 */
         data.buf_mgr = NULL;
     }
 
@@ -664,6 +893,17 @@ MPP_TEST_OUT:
     return ret;
 }
 
+/*
+ * main - 程序入口
+ *
+ * 使用方法示例：
+ *   mpi_dec_test -i input.h264 -t 7 -o output.yuv -n 100
+ *     -i: 输入码流文件
+ *     -t: 编码类型（7=H.264, 16777220=H.265, 参见 MppCodingType）
+ *     -o: 输出 YUV 文件（可选）
+ *     -n: 解码帧数（-1=无限循环, 0=解到文件结束, >0=指定帧数）
+ *     -w/-h: 视频宽高（JPEG 模式必须指定）
+ */
 int main(int argc, char **argv)
 {
     RK_S32 ret = 0;
@@ -671,16 +911,18 @@ int main(int argc, char **argv)
     MpiDecTestCmd* cmd = &cmd_ctx;
 
     memset((void*)cmd, 0, sizeof(*cmd));
-    cmd->format = MPP_FMT_BUTT;
-    cmd->pkt_size = MPI_DEC_STREAM_SIZE;
+    cmd->format = MPP_FMT_BUTT;              /* 输出格式默认无效值，表示不指定 */
+    cmd->pkt_size = MPI_DEC_STREAM_SIZE;     /* 每次读取的码流块大小 */
 
-    // parse the cmd option
+    /* 解析命令行参数（-i/-o/-t/-w/-h/-n 等） */
     ret = mpi_dec_test_cmd_init(cmd, argc, argv);
     if (ret)
         goto RET;
 
+    /* 打印当前配置信息（方便排查问题） */
     mpi_dec_test_cmd_options(cmd);
 
+    /* 执行解码（完整的创建→解码→销毁流程） */
     ret = dec_decode(cmd);
     if (MPP_OK == ret)
         mpp_log("test success max memory %.2f MB\n", cmd->max_usage / (float)(1 << 20));
@@ -688,7 +930,7 @@ int main(int argc, char **argv)
         mpp_err("test failed ret %d\n", ret);
 
 RET:
-    mpi_dec_test_cmd_deinit(cmd);
+    mpi_dec_test_cmd_deinit(cmd);  /* 释放命令行解析相关资源（reader 等） */
 
     return ret;
 }
